@@ -91,6 +91,13 @@ _validate_model_name() {
   [[ "$name" != "." && "$name" != ".." ]] || _die "VLLM_MODEL must not be '.' or '..': $name"
 }
 
+_validate_revision() {
+  local rev="$1"
+  [[ -z "$rev" ]] && return 0
+  [[ "$rev" =~ ^[A-Za-z0-9._-]+$ ]] || _die "VLLM_MODEL_REVISION must match ^[A-Za-z0-9._-]+\$: $rev"
+  [[ "$rev" != "." && "$rev" != ".." ]] || _die "VLLM_MODEL_REVISION must not be '.' or '..': $rev"
+}
+
 _run_to_log() {
   # Usage: _run_to_log <logfile> <cmd...>
   local log="$1"; shift
@@ -317,16 +324,20 @@ _verify_sha256sums() {
 
   local -A cached_entries=()
   if [[ "$use_cache" == "1" && -f "$cache_file" ]]; then
-    local _line _cf _cm _ch
-    while IFS=' ' read -r _cf _cm _ch; do
-      [[ "$_cf" == "#"* || -z "$_cf" ]] && continue
-      cached_entries["$_cf"]="${_cm} ${_ch}"
-    done < "$cache_file"
+    local _first_line _cf _cm _cs _ch
+    IFS= read -r _first_line < "$cache_file" || true
+    if [[ "$_first_line" == "# schema=2" ]]; then
+      while IFS=' ' read -r _cf _cm _cs _ch; do
+        [[ "$_cf" == "#"* || -z "$_cf" ]] && continue
+        cached_entries["$_cf"]="${_cm} ${_cs} ${_ch}"
+      done < "$cache_file"
+    fi
+    # schema=1 or unrecognized: discard (forces one-time rehash on upgrade)
   fi
 
   local failed=0 checked=0
   local -a new_cache_lines=()
-  new_cache_lines+=("# schema=1")
+  new_cache_lines+=("# schema=2")
 
   while IFS= read -r line; do
     [[ -z "$line" || "$line" == "#"* ]] && continue
@@ -341,15 +352,19 @@ _verify_sha256sums() {
     local fpath="$dir/$file_rel"
     [[ -f "$fpath" ]] || { _warn "integrity: referenced file missing: $file_rel"; failed=1; continue; }
 
-    local file_mtime
+    local file_mtime file_size
     file_mtime="$(stat -c '%Y' "$fpath" 2>/dev/null || stat -f '%m' "$fpath" 2>/dev/null || echo 0)"
+    file_size="$(stat -c '%s' "$fpath" 2>/dev/null || stat -f '%z' "$fpath" 2>/dev/null || echo 0)"
 
     if [[ "$use_cache" == "1" && -n "${cached_entries[$file_rel]:-}" ]]; then
-      local cached_mtime cached_hash
-      cached_mtime="${cached_entries[$file_rel]%% *}"
-      cached_hash="${cached_entries[$file_rel]#* }"
-      if [[ "$cached_mtime" == "$file_mtime" && "$cached_hash" == "$expected_hash" ]]; then
-        new_cache_lines+=("$file_rel $file_mtime $cached_hash")
+      local cached_mtime cached_size cached_hash _cache_val
+      _cache_val="${cached_entries[$file_rel]}"
+      cached_mtime="${_cache_val%% *}"
+      _cache_val="${_cache_val#* }"
+      cached_size="${_cache_val%% *}"
+      cached_hash="${_cache_val#* }"
+      if [[ "$cached_mtime" == "$file_mtime" && "$cached_size" == "$file_size" && "$cached_hash" == "$expected_hash" ]]; then
+        new_cache_lines+=("$file_rel $file_mtime $file_size $cached_hash")
         checked=$((checked + 1))
         continue
       fi
@@ -371,7 +386,7 @@ _verify_sha256sums() {
       _warn "integrity: SHA256 mismatch for $file_rel (expected $expected_hash, got $actual_hash)"
       failed=1
     else
-      new_cache_lines+=("$file_rel $file_mtime $actual_hash")
+      new_cache_lines+=("$file_rel $file_mtime $file_size $actual_hash")
       checked=$((checked + 1))
     fi
   done < "$sums_file"
@@ -385,7 +400,7 @@ _verify_sha256sums() {
   return "$failed"
 }
 
-_verify_nonzero_weights() {
+_verify_weight_sizes() {
   local dir="$1"
   shopt -s nullglob
   local wfiles=(
@@ -398,14 +413,32 @@ _verify_nonzero_weights() {
   )
   shopt -u nullglob
 
-  local f
+  local f fsize max_size=0
+  local -a sizes=()
+  local -a names=()
   for f in "${wfiles[@]}"; do
     [[ -f "$f" ]] || continue
-    if [[ ! -s "$f" ]]; then
+    fsize="$(stat -c '%s' "$f" 2>/dev/null || stat -f '%z' "$f" 2>/dev/null || echo 0)"
+    if [[ "$fsize" -eq 0 ]]; then
       _warn "integrity: zero-byte weight file: $(basename "$f")"
       return 1
     fi
+    sizes+=("$fsize")
+    names+=("$(basename "$f")")
+    (( fsize > max_size )) && max_size="$fsize"
   done
+
+  # If largest weight > 1 MiB, flag any weight < 1 KiB as suspiciously truncated
+  if (( max_size > 1048576 )); then
+    local i
+    for ((i=0; i<${#sizes[@]}; i++)); do
+      if (( sizes[i] < 1024 )); then
+        _warn "integrity: suspiciously small weight file: ${names[i]} (${sizes[i]} bytes vs largest ${max_size} bytes)"
+        return 1
+      fi
+    done
+  fi
+
   return 0
 }
 
@@ -474,8 +507,8 @@ PY
     return 0
   fi
 
-  # Strategy 3: nonzero weight check (fallback)
-  _verify_nonzero_weights "$dir"
+  # Strategy 3: weight size consistency check (fallback)
+  _verify_weight_sizes "$dir"
   return $?
 }
 
@@ -741,6 +774,7 @@ _validate_model_name "$VLLM_MODEL"
 VLLM_MODEL_ID="${VLLM_MODEL_ID:-}"
 VLLM_MODEL_ORG="${VLLM_MODEL_ORG:-}"
 VLLM_MODEL_REVISION="${VLLM_MODEL_REVISION:-}"
+_validate_revision "$VLLM_MODEL_REVISION"
 VLLM_MODEL_SOURCES="${VLLM_MODEL_SOURCES:-flox,local,hf-cache,r2,hf-hub}"
 VLLM_RESOLVE_LOCK_TIMEOUT="${VLLM_RESOLVE_LOCK_TIMEOUT:-300}"
 R2_MODEL_OBJECT_PREFIX="${R2_MODEL_OBJECT_PREFIX:-}"

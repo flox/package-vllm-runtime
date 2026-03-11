@@ -557,7 +557,9 @@ def run_nvidia_smi(target_devices: Optional[str] = None) -> List[List[str]]:
     return rows
 
 
-def evaluate_gpu_health(min_free_gb: float, max_temp_c: int, max_util_pct: int, want_json: bool, target_devices: Optional[str] = None) -> Tuple[List[dict], List[str]]:
+def evaluate_gpu_health(min_free_gb: float, max_temp_c: int, max_util_pct: int, want_json: bool, target_devices: Optional[str] = None, fail_on: Optional[Set[str]] = None) -> Tuple[List[dict], List[str]]:
+    if fail_on is None:
+        fail_on = {"temperature"}
     rows = run_nvidia_smi(target_devices)
     per_gpu: List[dict] = []
     failures: List[str] = []
@@ -576,11 +578,23 @@ def evaluate_gpu_health(min_free_gb: float, max_temp_c: int, max_util_pct: int, 
 
         warnings: List[str] = []
         if free_mib < min_free_mib:
-            warnings.append(f"GPU {idx} low free memory: {free_mib / 1024:.1f} GiB < {min_free_gb:.1f} GiB")
+            msg = f"GPU {idx} low free memory: {free_mib / 1024:.1f} GiB < {min_free_gb:.1f} GiB"
+            if "memory" in fail_on:
+                failures.append(msg)
+            else:
+                warnings.append(msg)
         if temp_c > max_temp_c:
-            failures.append(f"GPU {idx} temperature too high: {temp_c}C > {max_temp_c}C")
+            msg = f"GPU {idx} temperature too high: {temp_c}C > {max_temp_c}C"
+            if "temperature" in fail_on:
+                failures.append(msg)
+            else:
+                warnings.append(msg)
         if util_pct > max_util_pct:
-            warnings.append(f"GPU {idx} high utilization: {util_pct}% > {max_util_pct}%")
+            msg = f"GPU {idx} high utilization: {util_pct}% > {max_util_pct}%"
+            if "utilization" in fail_on:
+                failures.append(msg)
+            else:
+                warnings.append(msg)
         if clocks_reason not in ("N/A", "None", "Not Active", "", "0"):
             warnings.append(f"GPU {idx} clocks event active: {clocks_reason}")
 
@@ -623,12 +637,16 @@ def proc_tree_contains_listener_pids(root_pid: int, listener_pids: Set[int]) -> 
     return any(pid in descendants for pid in listener_pids)
 
 
-def wait_for_child_bind(root_pid: int, host: str, port: int, timeout_s: float, poll_s: float) -> Tuple[bool, Optional[str], Set[int]]:
+def wait_for_child_bind(root_pid: int, host: str, port: int, timeout_s: float, poll_s: float, child: Optional[subprocess.Popen] = None) -> Tuple[bool, Optional[str], Set[int]]:
     deadline = time.time() + timeout_s
     last_detail: Optional[str] = None
 
     while time.time() < deadline:
-        if not pid_exists(root_pid):
+        if child is not None:
+            rc = child.poll()
+            if rc is not None:
+                return False, f"child exited (rc={rc}) before binding target port", set()
+        elif not pid_exists(root_pid):
             return False, "child exited before binding target port", set()
 
         try:
@@ -694,7 +712,7 @@ def launch_and_proxy(downstream: Sequence[str], host: str, port: int, lock_fd: i
     except OSError as e:
         raise PreflightError(EXIT_GENERAL, f"Failed to start downstream command: {e}")
 
-    ok, detail, bind_pids = wait_for_child_bind(child.pid, host, port, bind_timeout, bind_poll)
+    ok, detail, bind_pids = wait_for_child_bind(child.pid, host, port, bind_timeout, bind_poll, child=child)
     if not ok:
         forward_signal_to_pgrp(child.pid, signal.SIGTERM)
         time.sleep(0.5)
@@ -728,6 +746,14 @@ def main(argv: Sequence[str]) -> int:
     min_free_gb = getenv_float("VLLM_MIN_FREE_GPU_GB", "4", min_value=0)
     max_temp_c = getenv_int("VLLM_MAX_GPU_TEMP_C", "85", min_value=1)
     max_util_pct = getenv_int("VLLM_MAX_GPU_UTIL_PCT", "95", min_value=0, max_value=100)
+
+    fail_on_raw = getenv_str("VLLM_GPU_FAIL_ON", "temperature")
+    fail_on = {s.strip().lower() for s in fail_on_raw.split(",") if s.strip()}
+    _valid_fail_on = {"temperature", "memory", "utilization"}
+    unknown_tokens = fail_on - _valid_fail_on
+    if unknown_tokens:
+        raise PreflightError(EXIT_GENERAL, f"VLLM_GPU_FAIL_ON contains unknown token(s): {', '.join(sorted(unknown_tokens))}. Valid: {', '.join(sorted(_valid_fail_on))}")
+
     bind_timeout = getenv_float("VLLM_START_BIND_TIMEOUT", "60", gt_zero=True)
     bind_poll = getenv_float("VLLM_START_BIND_POLL", "0.2", gt_zero=True)
 
@@ -753,7 +779,7 @@ def main(argv: Sequence[str]) -> int:
         )
 
         target_devices = getenv_str("VLLM_GPU_DEVICES", "") or os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        per_gpu, gpu_failures = evaluate_gpu_health(min_free_gb, max_temp_c, max_util_pct, want_json, target_devices or None)
+        per_gpu, gpu_failures = evaluate_gpu_health(min_free_gb, max_temp_c, max_util_pct, want_json, target_devices or None, fail_on=fail_on)
         if gpu_failures:
             raise PreflightError(
                 EXIT_GENERAL,

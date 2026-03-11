@@ -96,6 +96,7 @@ done
 # Defaults (avoid nounset exits)
 VLLM_PREFIX_CACHING="${VLLM_PREFIX_CACHING:-false}"
 VLLM_ENV_FILE_TRUSTED="${VLLM_ENV_FILE_TRUSTED:-false}"
+VLLM_STRICT_FLAGS="${VLLM_STRICT_FLAGS:-0}"
 
 # Ensure vllm exists early
 command -v vllm >/dev/null 2>&1 || die "'vllm' not found in PATH"
@@ -405,13 +406,31 @@ _GUARDED_FLAGS=(
 )
 
 if ((${#VLLM_EXTRA_ARGS[@]})); then
+  _strict=0
+  case "${VLLM_STRICT_FLAGS,,}" in
+    1|true|yes) _strict=1 ;;
+    0|false|no|'') _strict=0 ;;
+    *) die "VLLM_STRICT_FLAGS must be 1/true/yes or 0/false/no, got: $VLLM_STRICT_FLAGS" ;;
+  esac
+
+  _has_guarded_conflict=0
   for _arg in "${VLLM_EXTRA_ARGS[@]}"; do
     for _guarded in "${_GUARDED_FLAGS[@]}"; do
       if [[ "$_arg" == "$_guarded" || "$_arg" == "$_guarded="* ]]; then
-        warn "passthrough arg '$_arg' overrides validated flag '$_guarded'; the passthrough value will take precedence"
+        if ((_strict)); then
+          err "passthrough arg '$_arg' conflicts with validated flag '$_guarded' (VLLM_STRICT_FLAGS=1)"
+          _has_guarded_conflict=1
+        else
+          warn "passthrough arg '$_arg' overrides validated flag '$_guarded'; the passthrough value will take precedence"
+        fi
       fi
     done
   done
+
+  if ((_has_guarded_conflict)); then
+    die "Aborting: passthrough args conflict with validated flags. Remove conflicting args or unset VLLM_STRICT_FLAGS to allow overrides."
+  fi
+
   cmd+=("${VLLM_EXTRA_ARGS[@]}")
 fi
 
