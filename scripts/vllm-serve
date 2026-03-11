@@ -9,7 +9,7 @@
 #       VLLM_MODEL_ORG + VLLM_MODEL
 #
 #   Always required:
-#     FLOX_ENV_PROJECT            Project root (unless VLLM_CONFIG_FILE is set)
+#     FLOX_ENV_CACHE              Cache directory (also used for default config)
 #     VLLM_TENSOR_PARALLEL_SIZE   > 0
 #     VLLM_PIPELINE_PARALLEL_SIZE > 0
 #     VLLM_KV_CACHE_DTYPE         non-empty (no whitespace)
@@ -20,7 +20,7 @@
 # Optional env:
 #   VLLM_MODEL_ENV_FILE           Explicit env-file path (bypasses FLOX_ENV_CACHE/model id derivation)
 #   VLLM_PREFIX_CACHING           true/false/1/0/yes/no (default: false)
-#   VLLM_CONFIG_FILE              Override config path (default: $FLOX_ENV_PROJECT/config.yaml)
+#   VLLM_CONFIG_FILE              Override config path (default: $FLOX_ENV_CACHE/vllm-config.yaml)
 #   VLLM_ENV_FILE_TRUSTED         true/false/1/0/yes/no (default: false)
 #
 # SAFE env-file contract:
@@ -372,9 +372,22 @@ fi
 
 _config_file="${VLLM_CONFIG_FILE:-}"
 if [[ -z "$_config_file" ]]; then
-  require_nonempty FLOX_ENV_PROJECT
-  [[ -d "$FLOX_ENV_PROJECT" ]] || { err "FLOX_ENV_PROJECT is not a directory: $FLOX_ENV_PROJECT"; exit 2; }
-  _config_file="$FLOX_ENV_PROJECT/config.yaml"
+  require_nonempty FLOX_ENV_CACHE
+  [[ -d "$FLOX_ENV_CACHE" ]] || { err "FLOX_ENV_CACHE is not a directory: $FLOX_ENV_CACHE"; exit 2; }
+  _config_file="$FLOX_ENV_CACHE/vllm-config.yaml"
+
+  if [[ ! -f "$_config_file" ]]; then
+    _self="$(readlink -f "${BASH_SOURCE[0]}")"
+    _pkg_root="$(dirname "$(dirname "$_self")")"
+    _default_config="$_pkg_root/share/vllm-flox-runtime/config.yaml"
+    if [[ -f "$_default_config" ]]; then
+      cp -- "$_default_config" "$_config_file"
+      chmod 0644 "$_config_file"
+      warn "Copied default config to $_config_file -- edit it to customize."
+    else
+      die "Default config not found at $_default_config (broken installation?)"
+    fi
+  fi
 fi
 [[ -f "$_config_file" ]] || die "Config file not found: $_config_file"
 [[ -r "$_config_file" ]] || die "Config file not readable: $_config_file"

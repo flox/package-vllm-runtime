@@ -3,7 +3,7 @@
 let
   buildMeta = builtins.fromJSON (builtins.readFile ../../build-meta/vllm-flox-runtime.json);
   buildVersion = buildMeta.build_version;
-  version = "0.9.2";
+  version = "0.9.3";
 in
 
 stdenv.mkDerivation {
@@ -21,6 +21,7 @@ stdenv.mkDerivation {
     done
 
     mkdir -p $out/share/vllm-flox-runtime
+    install -m 0644 config.yaml $out/share/vllm-flox-runtime/config.yaml
     cat > $out/share/vllm-flox-runtime/flox-build-version-${toString buildVersion} <<'MARKER'
     build-version: ${toString buildVersion}
     upstream-version: ${version}
