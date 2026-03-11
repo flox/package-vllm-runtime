@@ -320,9 +320,10 @@ def is_zombie(pid: int) -> bool:
     return pid_state(pid) == "Z"
 
 
-def inode_to_pids(target_inodes: Set[str]) -> Tuple[Set[int], bool]:
+def inode_to_pids(target_inodes: Set[str]) -> Tuple[Set[int], bool, bool]:
     pids: Set[int] = set()
     could_scan = False
+    had_perm_errors = False
     for name in os.listdir("/proc"):
         if not name.isdigit():
             continue
@@ -330,7 +331,10 @@ def inode_to_pids(target_inodes: Set[str]) -> Tuple[Set[int], bool]:
         fd_dir = f"/proc/{pid}/fd"
         try:
             entries = os.listdir(fd_dir)
-        except (FileNotFoundError, PermissionError):
+        except PermissionError:
+            had_perm_errors = True
+            continue
+        except FileNotFoundError:
             continue
         except OSError:
             continue
@@ -347,7 +351,7 @@ def inode_to_pids(target_inodes: Set[str]) -> Tuple[Set[int], bool]:
             if m and m.group(1) in target_inodes:
                 pids.add(pid)
                 break
-    return pids, could_scan
+    return pids, could_scan, had_perm_errors
 
 
 def build_parent_chain(pid: int) -> List[int]:
@@ -447,11 +451,19 @@ def check_port_and_reclaim(host: str, port: int, stop_timeout: int, allow_other_
     if not inodes:
         return "clear", set(), set(), False
 
-    pids, could_scan = inode_to_pids(inodes)
+    pids, could_scan, had_perm_errors = inode_to_pids(inodes)
     if not pids:
+        if had_perm_errors:
+            raise PreflightError(EXIT_UNATTRIBUTABLE,
+                f"Listener(s) found on {host}:{port} but /proc fd attribution was blocked (hidepid/permissions?)",
+                {"host": host, "port": port})
         if could_scan:
-            raise PreflightError(EXIT_UNATTRIBUTABLE, f"Listener(s) found on {host}:{port} but owning process exited before attribution (race condition)", {"host": host, "port": port})
-        raise PreflightError(EXIT_UNATTRIBUTABLE, f"Listener(s) found on {host}:{port} but /proc attribution was blocked (hidepid/permissions?)", {"host": host, "port": port})
+            raise PreflightError(EXIT_UNATTRIBUTABLE,
+                f"Listener(s) found on {host}:{port} but owning process exited before attribution (race condition)",
+                {"host": host, "port": port})
+        raise PreflightError(EXIT_UNATTRIBUTABLE,
+            f"Listener(s) found on {host}:{port} but no /proc entries could be scanned",
+            {"host": host, "port": port})
 
     vllm_pids, non_vllm_pids = classify_vllm_processes(pids, extra_signatures)
     if non_vllm_pids:
@@ -502,7 +514,7 @@ def check_port_and_reclaim(host: str, port: int, stop_timeout: int, allow_other_
 
     remaining = find_listen_inodes(host, port)
     if remaining:
-        rem_pids, _ = inode_to_pids(remaining)
+        rem_pids, _, _ = inode_to_pids(remaining)
         payload = {
             "host": host,
             "port": port,
@@ -655,15 +667,17 @@ def wait_for_child_bind(root_pid: int, host: str, port: int, timeout_s: float, p
             return False, e.message, set()
 
         if inodes:
-            pids, could_scan = inode_to_pids(inodes)
+            pids, could_scan, had_perm_errors = inode_to_pids(inodes)
             if pids and proc_tree_contains_listener_pids(root_pid, pids):
                 return True, None, pids
             if pids:
                 last_detail = f"port owned by unrelated pid(s): {', '.join(str(p) for p in sorted(pids))}"
-            elif not could_scan:
+            elif had_perm_errors:
                 last_detail = "listener detected but could not attribute (permissions)"
-            else:
+            elif could_scan:
                 last_detail = "listener detected but owning process exited before match"
+            else:
+                last_detail = "listener detected but no /proc entries could be scanned"
 
         time.sleep(poll_s)
 

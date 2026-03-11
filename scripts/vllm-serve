@@ -413,25 +413,47 @@ if ((${#VLLM_EXTRA_ARGS[@]})); then
     *) die "VLLM_STRICT_FLAGS must be 1/true/yes or 0/false/no, got: $VLLM_STRICT_FLAGS" ;;
   esac
 
+  _GUARDED_BOOLEAN_FLAGS=(--enable-prefix-caching)
+  _filtered_extra=()
+  _skip_next=0
   _has_guarded_conflict=0
-  for _arg in "${VLLM_EXTRA_ARGS[@]}"; do
+
+  for (( _i=0; _i<${#VLLM_EXTRA_ARGS[@]}; _i++ )); do
+    _arg="${VLLM_EXTRA_ARGS[_i]}"
+    if ((_skip_next)); then _skip_next=0; continue; fi
+
+    _matched_guarded=""
     for _guarded in "${_GUARDED_FLAGS[@]}"; do
       if [[ "$_arg" == "$_guarded" || "$_arg" == "$_guarded="* ]]; then
-        if ((_strict)); then
-          err "passthrough arg '$_arg' conflicts with validated flag '$_guarded' (VLLM_STRICT_FLAGS=1)"
-          _has_guarded_conflict=1
-        else
-          warn "passthrough arg '$_arg' overrides validated flag '$_guarded'; the passthrough value will take precedence"
-        fi
+        _matched_guarded="$_guarded"; break
       fi
     done
+
+    if [[ -n "$_matched_guarded" ]]; then
+      if ((_strict)); then
+        err "passthrough arg '$_arg' conflicts with validated flag '$_matched_guarded' (VLLM_STRICT_FLAGS=1)"
+        _has_guarded_conflict=1
+      else
+        warn "stripping passthrough arg '$_arg' (conflicts with wrapper-owned flag '$_matched_guarded')"
+      fi
+      # For non-= form of value flags, skip the next token (the value)
+      if [[ "$_arg" != *"="* ]]; then
+        _is_bool=0
+        for _bf in "${_GUARDED_BOOLEAN_FLAGS[@]}"; do
+          [[ "$_matched_guarded" == "$_bf" ]] && _is_bool=1
+        done
+        ((_is_bool)) || _skip_next=1
+      fi
+    else
+      _filtered_extra+=("$_arg")
+    fi
   done
 
   if ((_has_guarded_conflict)); then
     die "Aborting: passthrough args conflict with validated flags. Remove conflicting args or unset VLLM_STRICT_FLAGS to allow overrides."
   fi
 
-  cmd+=("${VLLM_EXTRA_ARGS[@]}")
+  cmd+=("${_filtered_extra[@]}")
 fi
 
 if ((PRINT_CMD || DRY_RUN)); then
