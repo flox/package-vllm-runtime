@@ -753,6 +753,7 @@ def main(argv: Sequence[str]) -> int:
     dry_run = getenv_bool01("VLLM_DRY_RUN", "0")
     allow_other_uid_kill = getenv_bool01("VLLM_ALLOW_OTHER_UID_KILL", "0")
     proxy_child = getenv_bool01("VLLM_PREFLIGHT_PROXY_CHILD", "1")
+    skip_gpu_check = getenv_bool01("VLLM_SKIP_GPU_CHECK", "0")
 
     host = getenv_str("VLLM_HOST", "127.0.0.1")
     port = getenv_int("VLLM_PORT", "8000", min_value=1, max_value=65535)
@@ -792,14 +793,18 @@ def main(argv: Sequence[str]) -> int:
             extra_signatures,
         )
 
-        target_devices = getenv_str("VLLM_GPU_DEVICES", "") or os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        per_gpu, gpu_failures = evaluate_gpu_health(min_free_gb, max_temp_c, max_util_pct, want_json, target_devices or None, fail_on=fail_on)
-        if gpu_failures:
-            raise PreflightError(
-                EXIT_GENERAL,
-                "; ".join(gpu_failures),
-                {"host": host, "port": port, "gpus": per_gpu},
-            )
+        per_gpu: List[dict] = []
+        if skip_gpu_check:
+            log("INFO: VLLM_SKIP_GPU_CHECK=1; skipping GPU health check")
+        else:
+            target_devices = getenv_str("VLLM_GPU_DEVICES", "") or os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            per_gpu, gpu_failures = evaluate_gpu_health(min_free_gb, max_temp_c, max_util_pct, want_json, target_devices or None, fail_on=fail_on)
+            if gpu_failures:
+                raise PreflightError(
+                    EXIT_GENERAL,
+                    "; ".join(gpu_failures),
+                    {"host": host, "port": port, "gpus": per_gpu},
+                )
 
         payload = build_success_payload(host, port, port_action, reclaimed_roots, blocked_roots, could_scan, per_gpu)
         emit_json(payload, want_json)
