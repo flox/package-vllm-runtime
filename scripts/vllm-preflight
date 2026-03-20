@@ -23,6 +23,7 @@
 #   lock and proxies signals / exit status for the child. Set VLLM_PREFLIGHT_PROXY_CHILD=0
 #   to keep the older exec behavior.
 
+import ctypes
 import errno
 import fcntl
 import json
@@ -37,7 +38,21 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
+from ctypes import (
+    POINTER,
+    Structure,
+    byref,
+    c_char_p,
+    c_int,
+    c_uint,
+    c_ulonglong,
+    c_void_p,
+)
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+
+_NVML_TEMPERATURE_GPU = 0
+_NVML_PSTATE_UNKNOWN = 32
 
 
 EXIT_GENERAL = 1
@@ -530,51 +545,303 @@ def check_port_and_reclaim(host: str, port: int, stop_timeout: int, allow_other_
     return "reclaimed", roots, set(blocked), True
 
 
-def _gpu_check_torch(min_free_gb: float, fail_on: Set[str]) -> Optional[Tuple[List[dict], List[str]]]:
-    """Tier 1: GPU health via torch.cuda. Returns None if torch unavailable."""
+def _dlopen_first(names: List[str]):
+    """Try to dlopen the first available shared library from a list of names."""
+    for name in names:
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+def _cuda_driver_probe() -> dict:
+    """Probe CUDA driver via ctypes dlopen of libcuda.so.1.
+
+    Returns dict with keys: driver_present, device_count, driver_version, error.
+    """
+    out = {
+        "driver_present": False,
+        "device_count": 0,
+        "driver_version": None,
+        "error": None,
+    }
+    lib = _dlopen_first(["libcuda.so.1", "libcuda.so"])
+    if not lib:
+        out["error"] = "CUDA driver library not found (libcuda.so.1)."
+        return out
+
     try:
-        import torch
-    except ImportError:
-        return None
+        cuInit = lib.cuInit
+        cuInit.argtypes = [c_uint]
+        cuInit.restype = c_int
 
-    if not torch.cuda.is_available():
-        raise PreflightError(EXIT_GENERAL, "torch is available but CUDA is not (torch.cuda.is_available() == False)")
-    device_count = torch.cuda.device_count()
-    if device_count == 0:
-        raise PreflightError(EXIT_GENERAL, "torch.cuda reports 0 devices")
+        cuDeviceGetCount = lib.cuDeviceGetCount
+        cuDeviceGetCount.argtypes = [POINTER(c_int)]
+        cuDeviceGetCount.restype = c_int
 
-    per_gpu: List[dict] = []
-    failures: List[str] = []
-    min_free_mib = int(min_free_gb * 1024)
+        cuDriverGetVersion = getattr(lib, "cuDriverGetVersion", None)
+        if cuDriverGetVersion is not None:
+            cuDriverGetVersion.argtypes = [POINTER(c_int)]
+            cuDriverGetVersion.restype = c_int
 
-    for i in range(device_count):
-        props = torch.cuda.get_device_properties(i)
-        free_bytes, total_bytes = torch.cuda.mem_get_info(i)
-        total_mib = int(total_bytes / (1024 * 1024))
-        free_mib = int(free_bytes / (1024 * 1024))
+        rc = cuInit(0)
+        if rc != 0:
+            out["error"] = f"CUDA driver init failed (cuInit returned {rc})."
+            return out
 
-        warnings: List[str] = []
-        if free_mib < min_free_mib:
-            msg = f"GPU {i} low free memory: {free_mib / 1024:.1f} GiB < {min_free_gb:.1f} GiB"
-            if "memory" in fail_on:
-                failures.append(msg)
-            else:
-                warnings.append(msg)
+        n = c_int(0)
+        rc = cuDeviceGetCount(byref(n))
+        if rc != 0:
+            out["error"] = f"CUDA device query failed (cuDeviceGetCount returned {rc})."
+            return out
 
-        per_gpu.append(
-            {
-                "index": i,
-                "memory_total_mib": total_mib,
-                "memory_free_mib": free_mib,
-                "temperature_c": None,
-                "utilization_pct": None,
-                "pstate": None,
-                "clocks_event_reasons_active": None,
-                "warnings": warnings,
-            }
+        out["driver_present"] = True
+        out["device_count"] = int(n.value)
+
+        if cuDriverGetVersion is not None:
+            v = c_int(0)
+            rc = cuDriverGetVersion(byref(v))
+            if rc == 0:
+                out["driver_version"] = int(v.value)
+
+        return out
+    except Exception as e:
+        out["error"] = f"CUDA probe raised: {e}"
+        return out
+
+
+def _gpu_check_nvml(min_free_gb: float, max_temp_c: int, max_util_pct: int, target_devices: Optional[str], fail_on: Set[str]) -> Optional[Tuple[List[dict], List[str]]]:
+    """Tier 1: GPU health via ctypes NVML/CUDA driver probe.
+
+    Returns None if neither libcuda.so.1 nor libnvidia-ml.so.1 can be loaded (fall through to nvidia-smi).
+    """
+    # Phase 1 — CUDA driver probe (gate)
+    cuda = _cuda_driver_probe()
+    if not cuda["driver_present"]:
+        if cuda["error"]:
+            log(f"WARNING: CUDA driver probe: {cuda['error']}")
+        return None  # fall through to nvidia-smi
+
+    if cuda["device_count"] == 0:
+        raise PreflightError(
+            EXIT_GENERAL,
+            "CUDA driver present but 0 devices visible. "
+            "If running in a container, ensure it was started with GPU access "
+            "(e.g. --gpus all or NVIDIA_VISIBLE_DEVICES=all).",
         )
 
-    return per_gpu, failures
+    if cuda.get("driver_version"):
+        v = cuda["driver_version"]
+        log(f"INFO: CUDA driver version {v // 1000}.{(v % 1000) // 10}")
+
+    # Phase 2 — NVML detailed query
+    lib = _dlopen_first(["libnvidia-ml.so.1", "libnvidia-ml.so"])
+    if not lib:
+        log("WARNING: CUDA driver present but libnvidia-ml.so.1 not found; falling through")
+        return None
+
+    def _nvml_err_str(code: int) -> str:
+        try:
+            fn = lib.nvmlErrorString
+            fn.argtypes = [c_int]
+            fn.restype = c_char_p
+            s = fn(code)
+            return s.decode("utf-8", "replace") if s else f"NVML error {code}"
+        except Exception:
+            return f"NVML error {code}"
+
+    def _nvml_call(fn, *args):
+        rc = fn(*args)
+        if rc != 0:
+            raise RuntimeError(_nvml_err_str(int(rc)))
+
+    init_fn = getattr(lib, "nvmlInit_v2", None) or getattr(lib, "nvmlInit", None)
+    shutdown_fn = getattr(lib, "nvmlShutdown", None)
+    if init_fn is None or shutdown_fn is None:
+        log("WARNING: NVML init/shutdown symbols missing; falling through")
+        return None
+
+    init_fn.restype = c_int
+    shutdown_fn.restype = c_int
+
+    try:
+        _nvml_call(init_fn)
+    except RuntimeError as e:
+        log(f"WARNING: NVML init failed: {e}; falling through")
+        return None
+
+    try:
+        get_count = getattr(lib, "nvmlDeviceGetCount_v2", None) or getattr(lib, "nvmlDeviceGetCount", None)
+        get_handle = getattr(lib, "nvmlDeviceGetHandleByIndex_v2", None) or getattr(lib, "nvmlDeviceGetHandleByIndex", None)
+        get_mem = getattr(lib, "nvmlDeviceGetMemoryInfo", None)
+
+        if not (get_count and get_handle and get_mem):
+            log("WARNING: NVML device query symbols missing; falling through")
+            return None
+
+        get_count.argtypes = [POINTER(c_uint)]
+        get_count.restype = c_int
+
+        get_handle.argtypes = [c_uint, POINTER(c_void_p)]
+        get_handle.restype = c_int
+
+        class NvmlMemory(Structure):
+            _fields_ = [("total", c_ulonglong), ("free", c_ulonglong), ("used", c_ulonglong)]
+
+        get_mem.argtypes = [c_void_p, POINTER(NvmlMemory)]
+        get_mem.restype = c_int
+
+        # Optional NVML functions
+        get_temp = getattr(lib, "nvmlDeviceGetTemperature", None)
+        if get_temp:
+            get_temp.argtypes = [c_void_p, c_int, POINTER(c_uint)]
+            get_temp.restype = c_int
+
+        get_util = getattr(lib, "nvmlDeviceGetUtilizationRates", None)
+
+        class NvmlUtilization(Structure):
+            _fields_ = [("gpu", c_uint), ("memory", c_uint)]
+
+        if get_util:
+            get_util.argtypes = [c_void_p, POINTER(NvmlUtilization)]
+            get_util.restype = c_int
+
+        get_pstate = getattr(lib, "nvmlDeviceGetPerformanceState", None)
+        if get_pstate:
+            get_pstate.argtypes = [c_void_p, POINTER(c_int)]
+            get_pstate.restype = c_int
+
+        get_clocks = getattr(lib, "nvmlDeviceGetCurrentClocksEventReasons", None)
+        if get_clocks:
+            get_clocks.argtypes = [c_void_p, POINTER(c_ulonglong)]
+            get_clocks.restype = c_int
+
+        cnt = c_uint(0)
+        _nvml_call(get_count, byref(cnt))
+
+        # Build set of target device indices if specified
+        target_indices: Optional[Set[int]] = None
+        if target_devices:
+            target_indices = set()
+            for part in target_devices.split(","):
+                part = part.strip()
+                if part.isdigit():
+                    target_indices.add(int(part))
+                else:
+                    # Non-numeric device spec (UUID, etc.) — query all, let NVML/driver handle visibility
+                    target_indices = None
+                    break
+
+        per_gpu: List[dict] = []
+        failures: List[str] = []
+        min_free_mib = int(min_free_gb * 1024)
+
+        for idx in range(int(cnt.value)):
+            if target_indices is not None and idx not in target_indices:
+                continue
+
+            h = c_void_p()
+            _nvml_call(get_handle, c_uint(idx), byref(h))
+
+            # Memory (required)
+            mem = NvmlMemory()
+            _nvml_call(get_mem, h, byref(mem))
+            total_mib = int(mem.total // (1024 * 1024))
+            free_mib = int(mem.free // (1024 * 1024))
+
+            # Temperature (optional)
+            temperature_c: Optional[int] = None
+            if get_temp:
+                try:
+                    temp_val = c_uint(0)
+                    _nvml_call(get_temp, h, c_int(_NVML_TEMPERATURE_GPU), byref(temp_val))
+                    temperature_c = int(temp_val.value)
+                except Exception:
+                    pass
+
+            # Utilization (optional)
+            utilization_pct: Optional[int] = None
+            if get_util:
+                try:
+                    util = NvmlUtilization()
+                    _nvml_call(get_util, h, byref(util))
+                    utilization_pct = int(util.gpu)
+                except Exception:
+                    pass
+
+            # Performance state (optional)
+            pstate: Optional[str] = None
+            if get_pstate:
+                try:
+                    ps = c_int(0)
+                    _nvml_call(get_pstate, h, byref(ps))
+                    ps_val = int(ps.value)
+                    if ps_val != _NVML_PSTATE_UNKNOWN:
+                        pstate = f"P{ps_val}"
+                except Exception:
+                    pass
+
+            # Clock event reasons (optional)
+            clocks_event_reasons: Optional[str] = None
+            if get_clocks:
+                try:
+                    reasons = c_ulonglong(0)
+                    _nvml_call(get_clocks, h, byref(reasons))
+                    clocks_event_reasons = f"0x{int(reasons.value):016x}"
+                except Exception:
+                    pass
+
+            # Threshold checks
+            warnings: List[str] = []
+            if free_mib < min_free_mib:
+                msg = f"GPU {idx} low free memory: {free_mib / 1024:.1f} GiB < {min_free_gb:.1f} GiB"
+                if "memory" in fail_on:
+                    failures.append(msg)
+                else:
+                    warnings.append(msg)
+            if temperature_c is not None and temperature_c > max_temp_c:
+                msg = f"GPU {idx} temperature too high: {temperature_c}C > {max_temp_c}C"
+                if "temperature" in fail_on:
+                    failures.append(msg)
+                else:
+                    warnings.append(msg)
+            if utilization_pct is not None and utilization_pct > max_util_pct:
+                msg = f"GPU {idx} high utilization: {utilization_pct}% > {max_util_pct}%"
+                if "utilization" in fail_on:
+                    failures.append(msg)
+                else:
+                    warnings.append(msg)
+            if clocks_event_reasons is not None and clocks_event_reasons not in ("0x0000000000000000",):
+                warnings.append(f"GPU {idx} clocks event active: {clocks_event_reasons}")
+
+            per_gpu.append(
+                {
+                    "index": idx,
+                    "memory_total_mib": total_mib,
+                    "memory_free_mib": free_mib,
+                    "temperature_c": temperature_c,
+                    "utilization_pct": utilization_pct,
+                    "pstate": pstate,
+                    "clocks_event_reasons_active": clocks_event_reasons,
+                    "warnings": warnings,
+                }
+            )
+
+        if not per_gpu:
+            raise PreflightError(EXIT_GENERAL, "NVML reports 0 GPUs after device filtering")
+
+        return per_gpu, failures
+    except PreflightError:
+        raise
+    except RuntimeError as e:
+        log(f"WARNING: NVML query failed: {e}; falling through")
+        return None
+    finally:
+        try:
+            shutdown_fn()
+        except Exception:
+            pass
 
 
 def _gpu_check_nvidia_smi(min_free_gb: float, max_temp_c: int, max_util_pct: int, target_devices: Optional[str], fail_on: Set[str]) -> Optional[Tuple[List[dict], List[str]]]:
@@ -649,7 +916,7 @@ def _gpu_check_nvidia_smi(min_free_gb: float, max_temp_c: int, max_util_pct: int
                 failures.append(msg)
             else:
                 warnings.append(msg)
-        if clocks_reason not in ("N/A", "None", "Not Active", "", "0"):
+        if clocks_reason not in ("N/A", "None", "Not Active", "", "0", "0x0000000000000000"):
             warnings.append(f"GPU {idx} clocks event active: {clocks_reason}")
 
         per_gpu.append(
@@ -672,12 +939,12 @@ def evaluate_gpu_health(min_free_gb: float, max_temp_c: int, max_util_pct: int, 
     if fail_on is None:
         fail_on = {"temperature"}
 
-    # Tier 1: torch.cuda
-    result = _gpu_check_torch(min_free_gb, fail_on)
+    # Tier 1: NVML (ctypes probe of libcuda.so.1 / libnvidia-ml.so.1)
+    result = _gpu_check_nvml(min_free_gb, max_temp_c, max_util_pct, target_devices, fail_on)
     if result is not None:
-        log("INFO: GPU health check via torch.cuda")
+        log("INFO: GPU health check via NVML")
         per_gpu, failures = result
-        return per_gpu, failures, "torch"
+        return per_gpu, failures, "nvml"
 
     # Tier 2: nvidia-smi
     result = _gpu_check_nvidia_smi(min_free_gb, max_temp_c, max_util_pct, target_devices, fail_on)
@@ -687,7 +954,7 @@ def evaluate_gpu_health(min_free_gb: float, max_temp_c: int, max_util_pct: int, 
         return per_gpu, failures, "nvidia-smi"
 
     # Tier 3: no GPU tooling available
-    log("WARNING: No GPU health check available (torch and nvidia-smi both unavailable); proceeding without GPU validation")
+    log("WARNING: No GPU health check available (NVML and nvidia-smi both unavailable); proceeding without GPU validation")
     return [], [], "skipped"
 
 
