@@ -530,15 +530,60 @@ def check_port_and_reclaim(host: str, port: int, stop_timeout: int, allow_other_
     return "reclaimed", roots, set(blocked), True
 
 
-def which_nvidia_smi() -> str:
-    path = shutil.which("nvidia-smi")
-    if not path:
-        raise PreflightError(EXIT_GENERAL, "nvidia-smi not found in PATH")
-    return path
+def _gpu_check_torch(min_free_gb: float, fail_on: Set[str]) -> Optional[Tuple[List[dict], List[str]]]:
+    """Tier 1: GPU health via torch.cuda. Returns None if torch unavailable."""
+    try:
+        import torch
+    except ImportError:
+        return None
+
+    if not torch.cuda.is_available():
+        raise PreflightError(EXIT_GENERAL, "torch is available but CUDA is not (torch.cuda.is_available() == False)")
+    device_count = torch.cuda.device_count()
+    if device_count == 0:
+        raise PreflightError(EXIT_GENERAL, "torch.cuda reports 0 devices")
+
+    per_gpu: List[dict] = []
+    failures: List[str] = []
+    min_free_mib = int(min_free_gb * 1024)
+
+    for i in range(device_count):
+        props = torch.cuda.get_device_properties(i)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(i)
+        total_mib = int(total_bytes / (1024 * 1024))
+        free_mib = int(free_bytes / (1024 * 1024))
+
+        warnings: List[str] = []
+        if free_mib < min_free_mib:
+            msg = f"GPU {i} low free memory: {free_mib / 1024:.1f} GiB < {min_free_gb:.1f} GiB"
+            if "memory" in fail_on:
+                failures.append(msg)
+            else:
+                warnings.append(msg)
+
+        per_gpu.append(
+            {
+                "index": i,
+                "memory_total_mib": total_mib,
+                "memory_free_mib": free_mib,
+                "temperature_c": None,
+                "utilization_pct": None,
+                "pstate": None,
+                "clocks_event_reasons_active": None,
+                "warnings": warnings,
+            }
+        )
+
+    return per_gpu, failures
 
 
-def run_nvidia_smi(target_devices: Optional[str] = None) -> List[List[str]]:
-    exe = which_nvidia_smi()
+def _gpu_check_nvidia_smi(min_free_gb: float, max_temp_c: int, max_util_pct: int, target_devices: Optional[str], fail_on: Set[str]) -> Optional[Tuple[List[dict], List[str]]]:
+    """Tier 2: GPU health via nvidia-smi. Returns None if nvidia-smi unavailable or exec fails."""
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        log("WARNING: nvidia-smi not found in PATH")
+        return None
+
     cmd = [
         exe,
         "--query-gpu=index,memory.total,memory.free,temperature.gpu,utilization.gpu,pstate,clocks_event_reasons.active",
@@ -554,10 +599,13 @@ def run_nvidia_smi(target_devices: Optional[str] = None) -> List[List[str]]:
             check=False,
         )
     except OSError as e:
-        raise PreflightError(EXIT_GENERAL, f"Failed to execute nvidia-smi: {e}")
+        log(f"WARNING: Failed to execute nvidia-smi: {e}")
+        return None
     if proc.returncode != 0:
         msg = proc.stderr.strip() or proc.stdout.strip() or "nvidia-smi failed"
-        raise PreflightError(EXIT_GENERAL, f"nvidia-smi query failed: {msg}")
+        log(f"WARNING: nvidia-smi returned non-zero exit code: {msg}")
+        return None
+
     rows: List[List[str]] = []
     for line in proc.stdout.strip().splitlines():
         parts = [x.strip() for x in line.split(",")]
@@ -566,13 +614,7 @@ def run_nvidia_smi(target_devices: Optional[str] = None) -> List[List[str]]:
         rows.append(parts[:7])
     if not rows:
         raise PreflightError(EXIT_GENERAL, "No GPUs reported by nvidia-smi")
-    return rows
 
-
-def evaluate_gpu_health(min_free_gb: float, max_temp_c: int, max_util_pct: int, want_json: bool, target_devices: Optional[str] = None, fail_on: Optional[Set[str]] = None) -> Tuple[List[dict], List[str]]:
-    if fail_on is None:
-        fail_on = {"temperature"}
-    rows = run_nvidia_smi(target_devices)
     per_gpu: List[dict] = []
     failures: List[str] = []
     min_free_mib = int(min_free_gb * 1024)
@@ -626,8 +668,31 @@ def evaluate_gpu_health(min_free_gb: float, max_temp_c: int, max_util_pct: int, 
     return per_gpu, failures
 
 
-def build_success_payload(host: str, port: int, port_action: str, reclaimed_roots: Set[int], blocked_roots: Set[int], could_scan: bool, per_gpu: List[dict]) -> dict:
-    return {
+def evaluate_gpu_health(min_free_gb: float, max_temp_c: int, max_util_pct: int, want_json: bool, target_devices: Optional[str] = None, fail_on: Optional[Set[str]] = None) -> Tuple[List[dict], List[str], str]:
+    if fail_on is None:
+        fail_on = {"temperature"}
+
+    # Tier 1: torch.cuda
+    result = _gpu_check_torch(min_free_gb, fail_on)
+    if result is not None:
+        log("INFO: GPU health check via torch.cuda")
+        per_gpu, failures = result
+        return per_gpu, failures, "torch"
+
+    # Tier 2: nvidia-smi
+    result = _gpu_check_nvidia_smi(min_free_gb, max_temp_c, max_util_pct, target_devices, fail_on)
+    if result is not None:
+        log("INFO: GPU health check via nvidia-smi")
+        per_gpu, failures = result
+        return per_gpu, failures, "nvidia-smi"
+
+    # Tier 3: no GPU tooling available
+    log("WARNING: No GPU health check available (torch and nvidia-smi both unavailable); proceeding without GPU validation")
+    return [], [], "skipped"
+
+
+def build_success_payload(host: str, port: int, port_action: str, reclaimed_roots: Set[int], blocked_roots: Set[int], could_scan: bool, per_gpu: List[dict], gpu_check_source: Optional[str] = None) -> dict:
+    payload = {
         "ok": True,
         "host": host,
         "port": port,
@@ -637,6 +702,9 @@ def build_success_payload(host: str, port: int, port_action: str, reclaimed_root
         "could_scan": could_scan,
         "gpus": per_gpu,
     }
+    if gpu_check_source is not None:
+        payload["gpu_check_source"] = gpu_check_source
+    return payload
 
 
 def proc_tree_contains_listener_pids(root_pid: int, listener_pids: Set[int]) -> bool:
@@ -794,11 +862,12 @@ def main(argv: Sequence[str]) -> int:
         )
 
         per_gpu: List[dict] = []
+        gpu_check_source: Optional[str] = None
         if skip_gpu_check:
             log("INFO: VLLM_SKIP_GPU_CHECK=1; skipping GPU health check")
         else:
             target_devices = getenv_str("VLLM_GPU_DEVICES", "") or os.environ.get("CUDA_VISIBLE_DEVICES", "")
-            per_gpu, gpu_failures = evaluate_gpu_health(min_free_gb, max_temp_c, max_util_pct, want_json, target_devices or None, fail_on=fail_on)
+            per_gpu, gpu_failures, gpu_check_source = evaluate_gpu_health(min_free_gb, max_temp_c, max_util_pct, want_json, target_devices or None, fail_on=fail_on)
             if gpu_failures:
                 raise PreflightError(
                     EXIT_GENERAL,
@@ -806,7 +875,7 @@ def main(argv: Sequence[str]) -> int:
                     {"host": host, "port": port, "gpus": per_gpu},
                 )
 
-        payload = build_success_payload(host, port, port_action, reclaimed_roots, blocked_roots, could_scan, per_gpu)
+        payload = build_success_payload(host, port, port_action, reclaimed_roots, blocked_roots, could_scan, per_gpu, gpu_check_source=gpu_check_source)
         emit_json(payload, want_json)
 
         if want_json:
