@@ -1,7 +1,7 @@
 {
-  "build_version": 5,
+  "build_version": 6,
   "force_increment": 0,
-  "git_rev": "debcc2db3ec0e50e7275b6ed6d01f344e3219d71",
-  "git_rev_short": "debcc2d",
-  "changelog": "0.9.6: default VLLM_HOST to 0.0.0.0; cap max-tokens to 1024."
+  "git_rev": "e992d0e8a43bed998b81c93bcf344c9026752d04",
+  "git_rev_short": "e992d0e",
+  "changelog": "0.9.7: wire VLLM_MAX_TOKENS env var through vllm-serve (--max-tokens)."
 }
