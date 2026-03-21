@@ -1,7 +1,7 @@
 {
-  "build_version": 4,
+  "build_version": 5,
   "force_increment": 0,
-  "git_rev": "b15ab161bbe4f9d162e183588d466caa4714b578",
-  "git_rev_short": "b15ab16",
-  "changelog": "Default VLLM_HOST to 0.0.0.0 for K8s bind-all."
+  "git_rev": "debcc2db3ec0e50e7275b6ed6d01f344e3219d71",
+  "git_rev_short": "debcc2d",
+  "changelog": "0.9.6: default VLLM_HOST to 0.0.0.0; cap max-tokens to 1024."
 }
