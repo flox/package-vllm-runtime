@@ -1090,7 +1090,7 @@ def main(argv: Sequence[str]) -> int:
     proxy_child = getenv_bool01("VLLM_PREFLIGHT_PROXY_CHILD", "1")
     skip_gpu_check = getenv_bool01("VLLM_SKIP_GPU_CHECK", "0")
 
-    host = getenv_str("VLLM_HOST", "127.0.0.1")
+    host = getenv_str("VLLM_HOST", "0.0.0.0")
     port = getenv_int("VLLM_PORT", "8000", min_value=1, max_value=65535)
     stop_timeout = getenv_int("VLLM_STOP_TIMEOUT", "15", min_value=0)
     min_free_gb = getenv_float("VLLM_MIN_FREE_GPU_GB", "4", min_value=0)
