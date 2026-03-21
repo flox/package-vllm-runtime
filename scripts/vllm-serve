@@ -15,6 +15,7 @@
 #     VLLM_KV_CACHE_DTYPE         non-empty (no whitespace)
 #     VLLM_MAX_MODEL_LEN          > 0
 #     VLLM_MAX_NUM_BATCHED_TOKENS > 0
+#     VLLM_MAX_TOKENS             > 0
 #     VLLM_SERVED_MODEL_NAME      non-empty
 #
 # Optional env:
@@ -362,6 +363,7 @@ require_pos_int VLLM_TENSOR_PARALLEL_SIZE
 require_pos_int VLLM_PIPELINE_PARALLEL_SIZE
 require_pos_int VLLM_MAX_MODEL_LEN
 require_pos_int VLLM_MAX_NUM_BATCHED_TOKENS
+require_pos_int VLLM_MAX_TOKENS
 require_nonempty VLLM_SERVED_MODEL_NAME
 require_nonempty VLLM_KV_CACHE_DTYPE
 
@@ -403,6 +405,7 @@ cmd=(
   --kv-cache-dtype "$VLLM_KV_CACHE_DTYPE"
   --max-model-len "$VLLM_MAX_MODEL_LEN"
   --max-num-batched-tokens "$VLLM_MAX_NUM_BATCHED_TOKENS"
+  --max-tokens "$VLLM_MAX_TOKENS"
   --served-model-name "$VLLM_SERVED_MODEL_NAME"
 )
 
@@ -415,7 +418,7 @@ esac
 _GUARDED_FLAGS=(
   --config --tensor-parallel-size --pipeline-parallel-size
   --kv-cache-dtype --max-model-len --max-num-batched-tokens
-  --served-model-name --enable-prefix-caching
+  --max-tokens --served-model-name --enable-prefix-caching
 )
 
 if ((${#VLLM_EXTRA_ARGS[@]})); then
