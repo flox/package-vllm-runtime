@@ -1,7 +1,7 @@
 {
-  "build_version": 6,
+  "build_version": 7,
   "force_increment": 0,
-  "git_rev": "e992d0e8a43bed998b81c93bcf344c9026752d04",
-  "git_rev_short": "e992d0e",
+  "git_rev": "1e3ba72f8fa60c99f86ebc536f6852e7afd1c14c",
+  "git_rev_short": "1e3ba72",
   "changelog": "0.9.7: wire VLLM_MAX_TOKENS env var through vllm-serve (--max-tokens)."
 }
