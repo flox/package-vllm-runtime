@@ -3,7 +3,7 @@
 let
   buildMeta = builtins.fromJSON (builtins.readFile ../../build-meta/vllm-flox-runtime.json);
   buildVersion = buildMeta.build_version;
-  version = "0.9.6+${buildMeta.git_rev_short}";
+  version = "0.9.7+${buildMeta.git_rev_short}";
 in
 
 stdenv.mkDerivation {
