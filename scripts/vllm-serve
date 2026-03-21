@@ -394,22 +394,13 @@ fi
 [[ -f "$_config_file" ]] || die "Config file not found: $_config_file"
 [[ -r "$_config_file" ]] || die "Config file not readable: $_config_file"
 
-# max-tokens is a config-file-only setting in vLLM (no CLI flag).
-# Inject VLLM_MAX_TOKENS into an active copy so the user's base config
-# is never modified.
-_active_config="${_config_file%.yaml}.active.yaml"
-sed "s/^max-tokens:.*/max-tokens: $VLLM_MAX_TOKENS/" "$_config_file" > "$_active_config"
-if ! grep -q '^max-tokens:' "$_active_config"; then
-  printf '\nmax-tokens: %s\n' "$VLLM_MAX_TOKENS" >> "$_active_config"
-fi
-_config_file="$_active_config"
-
 # -----------------------------
 # Build argv
 # -----------------------------
 cmd=(
   vllm serve "$_VLLM_RESOLVED_MODEL"
   --config "$_config_file"
+  --override-generation-config "{\"max_new_tokens\": $VLLM_MAX_TOKENS}"
   --tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"
   --pipeline-parallel-size "$VLLM_PIPELINE_PARALLEL_SIZE"
   --kv-cache-dtype "$VLLM_KV_CACHE_DTYPE"
@@ -425,7 +416,8 @@ case "${VLLM_PREFIX_CACHING,,}" in
 esac
 
 _GUARDED_FLAGS=(
-  --config --tensor-parallel-size --pipeline-parallel-size
+  --config --override-generation-config
+  --tensor-parallel-size --pipeline-parallel-size
   --kv-cache-dtype --max-model-len --max-num-batched-tokens
   --served-model-name --enable-prefix-caching
 )
