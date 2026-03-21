@@ -1,7 +1,7 @@
 {
-  "build_version": 3,
+  "build_version": 4,
   "force_increment": 0,
-  "git_rev": "0af2747c5c9b7fcb9fd4b27d527a9e35c6e3f53b",
-  "git_rev_short": "0af2747",
-  "changelog": "Bundle default config.yaml; auto-copy to FLOX_ENV_CACHE on first run."
+  "git_rev": "b15ab161bbe4f9d162e183588d466caa4714b578",
+  "git_rev_short": "b15ab16",
+  "changelog": "Default VLLM_HOST to 0.0.0.0 for K8s bind-all."
 }
